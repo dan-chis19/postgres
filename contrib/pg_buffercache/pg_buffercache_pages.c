@@ -448,55 +448,66 @@ pg_buffercache_numa_pages(PG_FUNCTION_ARGS)
 		 * We don't hold the partition locks, so we don't get a consistent
 		 * snapshot across all buffers, but we do grab the buffer header
 		 * locks, so the information of each buffer is self-consistent.
-		 *
-		 * This loop touches and stores addresses into os_page_ptrs[] as input
-		 * to one big move_pages(2) inquiry system call. Basically we ask for
-		 * all memory pages for NBuffers.
 		 */
-		startptr = (char *) TYPEALIGN_DOWN(os_page_size, (char *) BufferGetBlock(1));
-		idx = 0;
 		for (i = 0; i < NBuffers; i++)
 		{
-			char	   *buffptr = (char *) BufferGetBlock(i + 1);
-			BufferDesc *bufHdr;
-			uint32		buf_state;
-			uint32		bufferid;
-			int32		page_num;
-			char	   *startptr_buff,
-					   *endptr_buff;
-
-			CHECK_FOR_INTERRUPTS();
-
-			bufHdr = GetBufferDescriptor(i);
-
-			/* Lock each buffer header before inspecting. */
-			buf_state = LockBufHdr(bufHdr);
-			bufferid = BufferDescriptorGetBuffer(bufHdr);
-			UnlockBufHdr(bufHdr, buf_state);
-
-			/* start of the first page of this buffer */
-			startptr_buff = (char *) TYPEALIGN_DOWN(os_page_size, buffptr);
-
-			/* end of the buffer (no need to align to memory page) */
-			endptr_buff = buffptr + BLCKSZ;
-
-			Assert(startptr_buff < endptr_buff);
-
-			/* calculate ID of the first page for this buffer */
-			page_num = (startptr_buff - startptr) / os_page_size;
-
-			/* Add an entry for each OS page overlapping with this buffer. */
-			for (char *ptr = startptr_buff; ptr < endptr_buff; ptr += os_page_size)
-			{
-				fctx->record[idx].bufferid = bufferid;
-				fctx->record[idx].page_num = page_num;
-				fctx->record[idx].numa_node = os_page_status[page_num];
-
-				/* advance to the next entry/page */
-				++idx;
-				++page_num;
-			}
+		    BufferDesc *bufHdr;
+		    uint32      buf_state;
+		    int         attempts = 0;
+		    const int   MAX_SPIN_ATTEMPTS = 1000;  // Add max sping attempts to avoid a hang situation which results in PANIC/crash
+		
+		    /* Allow interrupts and yield every 1000 buffers */
+		    if (i % 1000 == 0)
+		    {
+		        CHECK_FOR_INTERRUPTS();
+		        pg_usleep(0);  // Yield to other processes
+		    }
+		
+		    bufHdr = GetBufferDescriptor(i);
+		    
+		    /* Try to lock buffer header with timeout */
+		    while (true)
+		    {
+		        if (TryLockBufHdr(bufHdr, &buf_state))
+		            break;
+		
+		        if (++attempts > MAX_SPIN_ATTEMPTS)
+		        {
+		            ereport(ERROR,
+		                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+		                     errmsg("could not acquire buffer header lock after %d attempts",
+		                            MAX_SPIN_ATTEMPTS),
+		                     errdetail("Failed to lock buffer %d", i)));
+		        }
+		
+		        /* Brief sleep before retry, increasing with number of attempts (exponential backoff) */
+		        pg_usleep(Min(attempts * 10, 1000));  // Cap at 1ms
+		    }
+		
+		    /* Now safe to examine buffer state */
+		    fctx->record[i].bufferid = BufferDescriptorGetBuffer(bufHdr);
+		    fctx->record[i].relfilenumber = BufTagGetRelNumber(&bufHdr->tag);
+		    fctx->record[i].reltablespace = bufHdr->tag.spcOid;
+		    fctx->record[i].reldatabase = bufHdr->tag.dbOid;
+		    fctx->record[i].forknum = BufTagGetForkNum(&bufHdr->tag);
+		    fctx->record[i].blocknum = bufHdr->tag.blockNum;
+		    fctx->record[i].usagecount = BUF_STATE_GET_USAGECOUNT(buf_state);
+		    fctx->record[i].pinning_backends = BUF_STATE_GET_REFCOUNT(buf_state);
+		
+		    if (buf_state & BM_DIRTY)
+		        fctx->record[i].isdirty = true;
+		    else
+		        fctx->record[i].isdirty = false;
+		
+		    /* Note if the buffer is valid, and has storage created */
+		    if ((buf_state & BM_VALID) && (buf_state & BM_TAG_VALID))
+		        fctx->record[i].isvalid = true;
+		    else
+		        fctx->record[i].isvalid = false;
+		
+		    UnlockBufHdr(bufHdr, buf_state);
 		}
+
 
 		Assert((idx >= os_page_count) && (idx <= max_entries));
 
